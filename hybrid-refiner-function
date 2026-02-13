@@ -1,0 +1,105 @@
+"""
+title: Hybrid Refiner - Clean Parse (v1.5.1)
+author: openwebui-community
+version: 1.5.1
+"""
+
+from pydantic import BaseModel, Field
+import aiohttp
+import json
+import asyncio
+import time
+
+class Filter:
+    class Valves(BaseModel):
+        REVIEW_MODEL_ID: str = Field(default="models/gemini-pro-latest", description="Exact Model ID")
+        OPENWEBUI_API_KEY: str = Field(default="", description="Your sk- API Key")
+        Review_Enabled: bool = Field(default=True, description="Toggle hybrid review")
+
+    def __init__(self):
+        self.valves = self.Valves()
+
+    async def outlet(self, body: dict, __user__: dict, __event_emitter__=None) -> dict:
+        start_time = time.time()
+        if not self.valves.Review_Enabled:
+            return body
+
+        original_output = body["messages"][-1]["content"]
+        user_prompt = body["messages"][-2]["content"]
+
+        if __event_emitter__:
+            await __event_emitter__({
+                "type": "status",
+                "data": {"description": f"Refining with {self.valves.REVIEW_MODEL_ID}...", "done": False}
+            })
+
+        base_url = "http://127.0.0.1:8080" 
+        headers = {
+            "Authorization": f"Bearer {self.valves.OPENWEBUI_API_KEY}",
+            "Content-Type": "application/json"
+        }
+
+        payload = {
+            "model": self.valves.REVIEW_MODEL_ID,
+            "messages": [
+                {
+                    "role": "system", 
+                    "content": (
+                        "You are a Senior Code Reviewer. Review the user's draft code.\n\n"
+                        "1. If perfect, reply ONLY with 'PASS'.\n"
+                        "2. If it has errors, rewrite the code block correctly.\n"
+                        "3. After the code, add a brief bulleted list of fixes.\n"
+                        "4. End with:\nORIGINAL_GRADE: [Score]\nREFINED_GRADE: [Score]"
+                    )
+                },
+                {"role": "user", "content": f"Request: {user_prompt}\n\nDraft Content:\n{original_output}"}
+            ],
+            "stream": False 
+        }
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(f"{base_url}/api/chat/completions", headers=headers, json=payload, timeout=60) as response:
+                    
+                    refiner_duration = round(time.time() - start_time, 2)
+
+                    if __event_emitter__:
+                        await __event_emitter__({"type": "status", "data": {"description": "Refinement Complete", "done": True}})
+
+                    if response.status != 200:
+                        return body
+                    
+                    data = await response.json()
+                    if 'choices' in data and len(data['choices']) > 0:
+                        reviewer_response = data['choices'][0]['message']['content']
+                        
+                        char_count = len(reviewer_response)
+                        cps = round(char_count / refiner_duration, 1) if refiner_duration > 0 else 0
+
+                        stats_section = (
+                            f"\n\n<details>\n<summary>📊 Performance Metrics</summary>\n\n"
+                            f"* **Refiner:** `{self.valves.REVIEW_MODEL_ID}`\n"
+                            f"* **Cloud Latency:** {refiner_duration}s\n"
+                            f"* **Cloud Speed:** {cps} chars/sec\n"
+                            f"</details>"
+                        )
+
+                        context_section = (
+                            f"\n<details>\n<summary>📝 Original Generation Context</summary>\n\n"
+                            f"{original_output}\n\n"
+                            f"</details>"
+                        )
+
+                        if "PASS" in reviewer_response and len(reviewer_response) < 20:
+                            body["messages"][-1]["content"] += f"\n\n---\n**Original Grade:** 100/100 | **Refined Grade:** 100/100\n*(Verified by {self.valves.REVIEW_MODEL_ID})*{stats_section}"
+                            return body
+                        
+                        final_content = reviewer_response.replace("ORIGINAL_GRADE:", "**Original Grade:**").replace("REFINED_GRADE:", "**Refined Grade:**")
+                        body["messages"][-1]["content"] = f"{final_content}\n\n*(Refined by {self.valves.REVIEW_MODEL_ID})*{stats_section}{context_section}"
+                        
+                        return body
+                    return body
+        except Exception:
+            if __event_emitter__:
+                await __event_emitter__({"type": "status", "data": {"description": "Refiner Error", "done": True}})
+            return body
